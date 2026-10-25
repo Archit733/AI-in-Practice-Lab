@@ -76,8 +76,9 @@ else:
 n_errors = int((df.get("status", pd.Series([])) == "error").sum()) if "status" in df.columns else 0
 c[4].metric("errors", n_errors)
 
-# Refusal rate from ask spans
-ask_spans = df[df["name"] == "http.ask"] if "name" in df.columns else pd.DataFrame()
+# Refusal rate from ask spans (non-streaming and streaming requests)
+ask_spans = (df[df["name"].isin(["http.ask", "http.ask.stream"])]
+             if "name" in df.columns else pd.DataFrame())
 if len(ask_spans) > 0 and "refused" in ask_spans.columns:
     refusal_rate = ask_spans["refused"].fillna(False).mean()
     c[5].metric("refusal rate", f"{refusal_rate:.0%}")
@@ -167,7 +168,7 @@ else:
 # ---------------------------------------------------------------------------
 st.subheader("🚨 Alert: Refusal Rate Monitor")
 st.markdown("""
-**Alert condition:** Refusal rate doubles from its rolling baseline (window: 30 min).
+**Alert condition:** the last 5 minutes' refusal rate is at least double the preceding 30-minute baseline.
 
 **Why this one?** A broken index produces no errors, no latency spike, and no cost change.
 It just quietly stops finding relevant chunks — and a correctly-built RAG system responds
@@ -178,24 +179,30 @@ the index needs rebuilding. If hits are present but answers are still refusals, 
 content may have drifted out of scope relative to the queries.
 """)
 
+RECENT = pd.Timedelta(minutes=5)     # the window we are judging
+BASELINE = pd.Timedelta(minutes=30)  # the rolling window it is compared with
+
 if len(ask_spans) > 0 and "refused" in ask_spans.columns:
     ref = ask_spans.set_index("ts")["refused"].fillna(False).astype(int).sort_index()
-    if len(ref) >= 10:
-        baseline = ref.iloc[:len(ref)//2].mean()
-        recent = ref.iloc[len(ref)//2:].mean()
-        if baseline > 0 and recent > 2 * baseline:
-            st.error(f"🔴 ALERT: Refusal rate doubled! "
-                     f"Baseline: {baseline:.0%} → Recent: {recent:.0%}. "
-                     "Check the index and corpus immediately.")
+    now = ref.index.max()
+    recent = ref[ref.index > now - RECENT]
+    base = ref[(ref.index > now - RECENT - BASELINE) & (ref.index <= now - RECENT)]
+    if len(recent) >= 5 and len(base) >= 10:
+        b, r = base.mean(), recent.mean()
+        firing = (r >= 2 * b and r > 0) if b > 0 else r >= 0.25
+        if firing:
+            st.error(f"🔴 ALERT: refusal rate doubled — 30-min baseline {b:.0%} "
+                     f"→ last 5 min {r:.0%}. Check rag.retrieve n_hits, then the corpus.")
         else:
-            st.success(f"✅ Refusal rate normal — "
-                       f"baseline {baseline:.0%}, recent {recent:.0%}.")
-        st.line_chart(pd.DataFrame({
-            "refused": ref,
-            "rolling_10": ref.rolling(10, min_periods=1).mean(),
-        }))
+            st.success(f"✅ Refusal rate normal — 30-min baseline {b:.0%}, last 5 min {r:.0%}.")
     else:
-        st.info(f"Not enough data yet ({len(ref)} spans). Need ≥ 10 ask spans.")
+        st.info(f"Not enough data for the alert yet: {len(base)} requests in the 30-min "
+                f"baseline (need 10) and {len(recent)} in the last 5 min (need 5). "
+                "Showing the raw series below.")
+    st.line_chart(pd.DataFrame({
+        "refused": ref,
+        "rolling_30min": ref.rolling("30min").mean(),
+    }))
 else:
     st.info("No refusal data in traces yet.")
 

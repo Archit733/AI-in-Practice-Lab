@@ -46,10 +46,12 @@ if st.sidebar.button("Show metrics"):
             st.sidebar.json({
                 "total_requests": mdata.get("total_requests", 0),
                 "cache_hit_rate": f"{mdata.get('cache_hit_rate', 0):.1%}",
-                "cost_total": f"${mdata.get('cost_usd', 0):.5f}",
+                "cost_total": f"${mdata.get('cost_usd_total', 0):.5f}",
                 "cost_per_query": f"${mdata.get('cost_per_query_usd', 0):.5f}",
                 "p50_ms": mdata.get("p50_latency_ms", 0),
-                "p95_ms": mdata.get("p95_latency_ms", 0),
+                "p95_cached_ms": mdata.get("p95_latency_cached_ms", 0),
+                "p95_uncached_ms": mdata.get("p95_latency_uncached_ms", 0),
+                "refusal_rate": f"{mdata.get('refusal_rate', 0):.1%}",
                 "error_rate": f"{mdata.get('error_rate', 0):.1%}",
             })
     except requests.RequestException as exc:
@@ -83,6 +85,66 @@ clear_btn = col2.button("Clear")
 
 if clear_btn:
     st.rerun()
+
+stream_mode = st.sidebar.toggle("Stream the answer (/ask/stream)", value=False)
+
+
+def _stream(question: str) -> None:
+    """B3: prose streams in; citations arrive, validated, in the final event."""
+    import json as _json
+
+    box = st.empty()
+    text, final = "", None
+    try:
+        with requests.post(f"{API}/ask/stream", json={"question": question},
+                           stream=True, timeout=120) as r:
+            if r.status_code != 200:
+                st.error(f"{r.status_code}: {r.text[:300]}")
+                return
+            for line in r.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    break
+                ev = _json.loads(payload)
+                if "token" in ev:
+                    text += ev["token"]
+                    box.markdown(text + " ▌")
+                elif "error" in ev:
+                    st.error(f"{ev['error']}: {ev.get('detail', '')}")
+                    return
+                else:
+                    final = ev
+    except requests.RequestException as exc:
+        st.error(f"Service unreachable: {exc}")
+        return
+
+    box.markdown(text)
+    if not final:
+        return
+    if final.get("refused"):
+        st.warning("⚠️ The documents do not cover this question.")
+    elif not final.get("citations_valid", True):
+        st.error("⚠️ This answer cited sources that do not exist "
+                 f"({final.get('invalid_citations')}). Do not rely on it.")
+    if final.get("citations"):
+        st.subheader("📚 Sources")
+        for c in final["citations"]:
+            with st.expander(f"[{c['index']}] {c['doc_id']}"):
+                st.markdown(f"> {c['excerpt']}")
+    st.divider()
+    cols = st.columns(4)
+    cols[0].metric("time to first token", f"{final.get('ttft_ms', 0):.0f} ms")
+    cols[1].metric("total", f"{final.get('latency_ms', 0):.0f} ms")
+    cols[2].metric("cost", f"${final.get('cost_usd', 0):.5f}")
+    cols[3].metric("sources", len(final.get("citations", [])))
+    st.caption(f"trace id: `{final.get('trace_id', '')}`")
+
+
+if ask_btn and q and stream_mode:
+    _stream(q)
+    st.stop()
 
 if ask_btn and q:
     with st.spinner("thinking…"):

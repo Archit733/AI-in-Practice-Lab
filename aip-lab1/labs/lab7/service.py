@@ -1,140 +1,102 @@
 #!/usr/bin/env python3
-"""Lab 7 — the service.
+"""Lab 7 -- the service.
 
-    uvicorn labs.lab7.service:app --reload --port 8000
+    uvicorn labs.lab7.service:app --port 8000
     curl -s localhost:8000/ask -H 'content-type: application/json' \
          -d '{"question":"How long do I have to file a claim?"}' | jq
 
-Two cache layers:
-  1. Exact response cache   — hash of normalised question text
-  2. Semantic cache         — cosine similarity of question embedding, threshold 0.95
-                              NOTE: threshold was measured empirically. At 0.92
-                              we observed wrong answers for questions differing
-                              only by plan name (Gold vs Silver). 0.95 is the
-                              safe lower bound; even so, monitor refusal rate.
+Pipeline: built once at startup from labs/lab7/pipeline.py -- the same
+definition the regression gate tests.
 
-Streaming (POST /ask/stream):
-  Strategy chosen (B3): stream prose, hold citations to the end.
-  Rationale: TTFT benefit is preserved; the UI renders the grounded answer as
-  a final "citations" SSE event. The cost is that citations arrive late —
-  acceptable here because users can read the answer first and then verify.
+Two cache layers (B1):
+  1. Exact response cache -- SHA-256 of (pipeline config + normalised question).
+     The config is part of the key, so changing FINAL_K or the chunking cannot
+     serve answers produced by the old pipeline.
+  2. Semantic cache -- cosine similarity of question embeddings, threshold 0.95.
+     Returns the *closest* stored question, and logs which one matched and how
+     similar it was, so a wrong hit is diagnosable from the trace.
+     At ~0.93 questions differing only by plan name (Gold vs Silver) collide;
+     labs/lab7/sem_sweep.py measures this.
+
+Streaming (B2/B3): POST /ask/stream streams real model tokens as they are
+generated. Strategy chosen: stream the prose, hold the citations to the end.
+Citations are validated once generation finishes and arrive in the final
+event with `citations_valid` / `invalid_citations`, which the UI acts on.
+
+Errors (A3): 422 malformed request (Pydantic) - 429 budget exhausted -
+503 + Retry-After for model outages or an offline cache miss - 500 with a
+trace id (never a stack trace) for genuine bugs.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import sys
+import threading
 import time
+import uuid
+from collections import deque
 from pathlib import Path
-from typing import AsyncGenerator
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from aip import cache, tracing  # noqa: E402
+from aip import cache, cost, tracing  # noqa: E402
+from aip.cache import CacheMiss  # noqa: E402
 from aip.cost import BudgetExceeded, global_budget  # noqa: E402
 from aip.embed import embed  # noqa: E402
+from labs.lab7 import pipeline as shipped  # noqa: E402
 
-app = FastAPI(title="Aurora Policy Assistant", version="1.0")
+app = FastAPI(title="Aurora Policy Assistant", version="1.1")
 
 _PIPELINE = None
-_RETRIEVER = None
+_STARTUP_ERROR: str | None = None
 _STARTED = time.time()
+_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
-# In-memory semantic cache: list of (embedding_vector, question, response)
+# Semantic cache (in-memory): (embedding, question, response)
 # ---------------------------------------------------------------------------
+_SEM_THRESHOLD = 0.95   # see labs/lab7/sem_sweep.py for the measurement
 _SEM_CACHE: list[tuple[np.ndarray, str, dict]] = []
-_SEM_THRESHOLD = 0.95       # measured empirically — see module docstring
-_EXACT_HITS = 0
-_SEM_HITS = 0
-_TOTAL_REQUESTS = 0
-_ERRORS: list[dict] = []
-_LATENCIES: list[float] = []   # per-request end-to-end ms
-
-
-def _norm_question(q: str) -> str:
-    """Normalise for exact-cache keying: lowercase, collapse whitespace."""
-    return " ".join(q.lower().split())
-
-
-def _exact_cache_key(q: str) -> str:
-    blob = _norm_question(q)
-    return hashlib.sha256(blob.encode()).hexdigest()
-
-
-def _sem_lookup(q_vec: np.ndarray) -> dict | None:
-    """Return cached response if cosine similarity >= _SEM_THRESHOLD."""
-    for (stored_vec, _stored_q, stored_resp) in _SEM_CACHE:
-        sim = float(q_vec @ stored_vec)
-        if sim >= _SEM_THRESHOLD:
-            return stored_resp
-    return None
-
-
-def _sem_store(q_vec: np.ndarray, question: str, resp: dict) -> None:
-    _SEM_CACHE.append((q_vec, question, resp))
-
 
 # ---------------------------------------------------------------------------
-# Pipeline (built once at startup)
+# Request ledger for /metrics and the refusal alert
 # ---------------------------------------------------------------------------
+_REQUESTS: deque[dict] = deque(maxlen=10_000)  # {ts, latency_ms, layer, refused, cost_usd}
+_ERRORS: deque[dict] = deque(maxlen=10_000)
+_TOTAL = 0
+
+PROVIDER_OUTAGE_MARKERS = ("503", "502", "overloaded", "serviceunavailable", "unavailable",
+                           "rate_limit", "ratelimit", "429", "timeout", "apiconnection")
+
+
 def pipeline():
-    """Build the Labs 3-5 pipeline once, at startup, and cache it.
-
-    Uses: markdown chunking (400 chars, Lab 3 winner), HybridRetriever
-    (dense + BM25 with RRF k=60), and the Lab 4 answer pipeline with
-    citation validation and repair from aip.rag.RagPipeline.
-
-    Lab 6 guards are wired in via ToolGuard on the retriever's allowlist
-    and via enforce_citations inside the pipeline's generate stage.
-    """
-    global _PIPELINE, _RETRIEVER
+    global _PIPELINE
     if _PIPELINE is None:
-        from aip.chunking import markdown_chunks
-        from aip.rag import RagPipeline
-        from aip.retrieval import Bm25Retriever, DenseRetriever, HybridRetriever
-
-        CORPUS_DIR = ROOT / "data/corpus"
-        corpus = {p.stem: p.read_text(encoding="utf-8")
-                  for p in sorted(CORPUS_DIR.glob("*.md"))}
-
-        # Lab 3 winner: markdown-aware chunking at 400 chars, archived excluded
-        chunks = [c for doc_id, text in corpus.items()
-                  if "ARCHIVED" not in doc_id
-                  for c in markdown_chunks(text, doc_id, size=400)]
-
-        dense = DenseRetriever(chunks, show_progress=False)
-        bm25 = Bm25Retriever(chunks)
-        _RETRIEVER = HybridRetriever([dense, bm25], rrf_k=60)
-
-        _PIPELINE = RagPipeline(
-            _RETRIEVER,
-            k=12,
-            final_k=5,
-            tier="MAIN",
-            max_context_chars=8000,
-        )
+        _PIPELINE = shipped.build_pipeline()
     return _PIPELINE
 
 
-# Force pipeline build at import time (startup), not on first request.
-try:
+try:  # build at startup, not on the first request
     pipeline()
-except Exception:
-    pass   # If imports fail at import time (e.g., missing key), fail on first request
+except Exception as exc:  # noqa: BLE001 -- surfaced in /health and as 503s
+    _STARTUP_ERROR = f"{type(exc).__name__}: {str(exc)[:300]}"
 
 
 # ---------------------------------------------------------------------------
-# Request/Response models
+# Models
 # ---------------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(min_length=3, max_length=1000)
+    # top_k / mode are accepted for contract compatibility. The shipped
+    # configuration is fixed in pipeline.py (FINAL_K) so the gate tests
+    # exactly what is served; "tools" mode is not enabled in this deployment.
     top_k: int = Field(default=5, ge=1, le=20)
     mode: str = Field(default="rag", pattern="^(rag|tools)$")
 
@@ -152,239 +114,353 @@ class AskResponse(BaseModel):
     latency_ms: float
     cost_usd: float
     cached: bool
+    cache_layer: str = "none"          # "exact" | "semantic" | "none"
     trace_id: str
+    source_trace_id: str | None = None  # trace of the request that produced a cached answer
 
 
 # ---------------------------------------------------------------------------
-# Helper: build a response dict from a RagAnswer
+# Helpers
 # ---------------------------------------------------------------------------
-def _build_response(result, *, cached: bool, trace_id: str, latency_ms: float,
-                    cost_before: float) -> dict:
-    cost_after = global_budget().spent_usd
-    cost_usd = max(0.0, cost_after - cost_before)
+def _norm_question(q: str) -> str:
+    return " ".join(q.lower().split())
 
-    citations = []
-    for i, hit in enumerate(result.hits, start=1):
-        citations.append(Citation(
-            index=i,
-            doc_id=hit.doc_id,
-            excerpt=hit.text[:400],
-        ))
 
-    return {
-        "answer": result.answer,
-        "refused": result.refused,
-        "citations": [c.model_dump() for c in citations],
-        "latency_ms": round(latency_ms, 1),
-        "cost_usd": round(cost_usd, 6),
-        "cached": cached,
-        "trace_id": trace_id,
-    }
+def _exact_key(q: str) -> str:
+    blob = json.dumps({"cfg": shipped.config_dict(), "q": _norm_question(q)}, sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _sem_lookup(q_vec: np.ndarray) -> tuple[dict, str, float] | None:
+    best: tuple[dict, str, float] | None = None
+    for vec, question, resp in _SEM_CACHE:
+        sim = float(q_vec @ vec)
+        if sim >= _SEM_THRESHOLD and (best is None or sim > best[2]):
+            best = (resp, question, sim)
+    return best
+
+
+def _citations(hits) -> list[dict]:
+    return [{"index": i, "doc_id": h.doc_id, "excerpt": h.text[:400]}
+            for i, h in enumerate(hits, start=1)]
+
+
+def _record(latency_ms: float, layer: str, refused: bool, cost_usd: float) -> None:
+    with _LOCK:
+        _REQUESTS.append({"ts": time.time(), "latency_ms": latency_ms, "layer": layer,
+                          "refused": bool(refused), "cost_usd": cost_usd})
+
+
+def _record_error(kind: str, detail: str = "") -> None:
+    with _LOCK:
+        _ERRORS.append({"type": kind, "ts": time.time(), "detail": detail[:200]})
+
+
+def _classify(exc: Exception) -> HTTPException:
+    """Map an exception to the status code that tells the client what to do."""
+    if isinstance(exc, BudgetExceeded):
+        _record_error("budget_exceeded", str(exc))
+        return HTTPException(429, detail="spend budget exhausted -- try later")
+    if isinstance(exc, CacheMiss):
+        _record_error("offline_cache_miss", str(exc))
+        return HTTPException(503, detail="answer not available offline",
+                             headers={"Retry-After": "30"})
+    text = f"{type(exc).__name__} {exc}".lower()
+    if any(m in text for m in PROVIDER_OUTAGE_MARKERS):
+        _record_error("provider_outage", str(exc))
+        return HTTPException(503, detail="upstream model unavailable -- try again shortly",
+                             headers={"Retry-After": "30"})
+    _record_error("internal_error", f"{type(exc).__name__}: {exc}")
+    return HTTPException(500, detail="internal error")
+
+
+def _ensure_ready() -> None:
+    if _STARTUP_ERROR and _PIPELINE is None:
+        try:
+            pipeline()
+        except Exception as exc:  # noqa: BLE001
+            raise _classify(exc) from exc
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# POST /ask
 # ---------------------------------------------------------------------------
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
-    """A1: Returns cost and trace_id in the response body.
-
-    Cache flow:
-      1. Exact hit  → return immediately (no model call)
-      2. Semantic hit → return immediately (no model call)
-      3. Miss → run pipeline, store in both caches
-    """
-    global _EXACT_HITS, _SEM_HITS, _TOTAL_REQUESTS, _ERRORS, _LATENCIES
-
+    """A1: answer + citations + latency + cost + trace id in the body."""
+    global _TOTAL
+    with _LOCK:
+        _TOTAL += 1
     t0 = time.perf_counter()
-    _TOTAL_REQUESTS += 1
     cost_before = global_budget().spent_usd
 
     try:
+        _ensure_ready()
         with tracing.trace("http.ask", question=req.question[:120]) as span:
-            pipe = pipeline()
+            trace_id = span["span_id"]
 
-            # --- 1. Exact cache ---
-            exact_key = _exact_cache_key(req.question)
-            cached_resp = cache.get(exact_key)
-            if cached_resp is not None:
-                _EXACT_HITS += 1
-                latency_ms = (time.perf_counter() - t0) * 1000
-                _LATENCIES.append(latency_ms)
-                span["cache_hit"] = "exact"
-                cached_resp["latency_ms"] = round(latency_ms, 1)
-                cached_resp["cached"] = True
-                return AskResponse(**cached_resp)
+            # 1. exact cache
+            key = _exact_key(req.question)
+            hit = cache.get(key)
+            if hit is not None:
+                ms = (time.perf_counter() - t0) * 1000
+                span.update(cache_hit="exact", refused=hit["refused"])
+                _record(ms, "exact", hit["refused"], 0.0)
+                return AskResponse(**{**hit, "latency_ms": round(ms, 1), "cost_usd": 0.0,
+                                      "cached": True, "cache_layer": "exact",
+                                      "trace_id": trace_id,
+                                      "source_trace_id": hit.get("trace_id")})
 
-            # --- 2. Semantic cache ---
+            # 2. semantic cache
             q_vec = embed(req.question, input_type="query")
-            sem_resp = _sem_lookup(q_vec)
-            if sem_resp is not None:
-                _SEM_HITS += 1
-                latency_ms = (time.perf_counter() - t0) * 1000
-                _LATENCIES.append(latency_ms)
-                span["cache_hit"] = "semantic"
-                sem_resp = dict(sem_resp)
-                sem_resp["latency_ms"] = round(latency_ms, 1)
-                sem_resp["cached"] = True
-                return AskResponse(**sem_resp)
+            sem = _sem_lookup(q_vec)
+            if sem is not None:
+                resp, matched_q, sim = sem
+                ms = (time.perf_counter() - t0) * 1000
+                span.update(cache_hit="semantic", refused=resp["refused"],
+                            matched_question=matched_q[:120], similarity=round(sim, 4))
+                _record(ms, "semantic", resp["refused"], 0.0)
+                return AskResponse(**{**resp, "latency_ms": round(ms, 1), "cost_usd": 0.0,
+                                      "cached": True, "cache_layer": "semantic",
+                                      "trace_id": trace_id,
+                                      "source_trace_id": resp.get("trace_id")})
 
-            # --- 3. Cache miss — run pipeline ---
-            span["cache_hit"] = "none"
-            result = pipe.answer(req.question)
-            span["refused"] = result.refused
-            span["n_citations"] = len(result.hits)
+            # 3. miss -> run the pipeline
+            result = pipeline().answer(req.question)
+            ms = (time.perf_counter() - t0) * 1000
+            spent = max(0.0, global_budget().spent_usd - cost_before)
+            span.update(cache_hit="none", refused=result.refused,
+                        n_citations=len(result.hits), cost_usd=round(spent, 6))
+            resp = {
+                "answer": result.answer,
+                "refused": result.refused,
+                # A refusal is supported by nothing, so it cites nothing.
+                "citations": [] if result.refused else _citations(result.hits),
+                "latency_ms": round(ms, 1),
+                "cost_usd": round(spent, 6),
+                "cached": False,
+                "cache_layer": "none",
+                "trace_id": trace_id,
+            }
+            _record(ms, "none", result.refused, spent)
+            cache.put(key, "response", {"question": req.question}, resp)
+            _SEM_CACHE.append((q_vec, req.question, resp))
+            return AskResponse(**resp)
 
-            latency_ms = (time.perf_counter() - t0) * 1000
-            _LATENCIES.append(latency_ms)
-
-            resp_dict = _build_response(
-                result, cached=False,
-                trace_id=span["span_id"],
-                latency_ms=latency_ms,
-                cost_before=cost_before,
-            )
-
-            # Store in exact cache (content-addressed SQLite)
-            cache.put(exact_key, "response", {"question": req.question}, resp_dict)
-
-            # Store in semantic cache (in-memory)
-            _sem_store(q_vec, req.question, resp_dict)
-
-            return AskResponse(**resp_dict)
-
-    except BudgetExceeded as exc:
-        _ERRORS.append({"type": "budget_exceeded", "ts": time.time()})
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
-    except NotImplementedError:
+    except HTTPException:
         raise
-    except Exception as exc:   # noqa: BLE001
-        # A3: distinguish provider outage (503 + Retry-After) from other errors
-        err_text = str(exc).lower()
-        is_provider_outage = any(m in err_text for m in (
-            "503", "502", "overloaded", "serviceunavailable",
-            "rate_limit", "ratelimit", "429", "timeout",
-        ))
-        _ERRORS.append({"type": "provider_outage" if is_provider_outage else "error",
-                        "ts": time.time(), "detail": str(exc)[:200]})
-        if is_provider_outage:
-            raise HTTPException(
-                status_code=503,
-                detail="upstream model unavailable — try again shortly",
-                headers={"Retry-After": "30"},
-            ) from exc
-        raise HTTPException(
-            status_code=503, detail="upstream error",
-            headers={"Retry-After": "30"},
-        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _classify(exc) from exc
+
+
+# ---------------------------------------------------------------------------
+# POST /ask/stream -- real token streaming, citations held to the end (B3)
+# ---------------------------------------------------------------------------
+def _sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
 
 
 @app.post("/ask/stream")
-async def ask_stream(req: AskRequest) -> StreamingResponse:
-    """B2: Server-sent events streaming.
+def ask_stream(req: AskRequest) -> StreamingResponse:
+    """B2/B3. Retrieval happens before the response starts, so a budget or
+    outage problem there still gets a proper status code. Once tokens flow the
+    status is already 200, so later failures arrive as an `error` event."""
+    from aip.config import resolve_model, settings
+    from aip.guards import delimit_untrusted, enforce_citations
+    from aip.llm import _normalise
+    from aip.rag import REFUSAL
+    from aip.retrieval import format_context
 
-    B3 strategy: stream prose tokens, hold citations to the end.
-    The first SSE event contains the text tokens; the final event carries
-    the citations and metadata. This preserves TTFT while keeping citation
-    validation deterministic (we validate after generation).
-    """
-    async def generate() -> AsyncGenerator[str, None]:
-        t0 = time.perf_counter()
-        cost_before = global_budget().spent_usd
+    global _TOTAL
+    with _LOCK:
+        _TOTAL += 1
+    t0 = time.perf_counter()
+    if global_budget().spent_usd >= global_budget().limit_usd:
+        raise _classify(BudgetExceeded("budget exhausted"))
+    try:
+        _ensure_ready()
+        pipe = pipeline()
+        with tracing.trace("stream.retrieve", question=req.question[:120]):
+            hits = pipe.rerank(req.question, pipe.retrieve(req.question))
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _classify(exc) from exc
+
+    # Same prompt and request shape as RagPipeline.generate -> same cache key,
+    # so streamed and non-streamed answers share the model-call cache.
+    context = delimit_untrusted(format_context(hits, max_chars=pipe.max_context_chars))
+    prompt = f"{context}\n\nQuestion: {req.question}\n\nAnswer with citations:"
+    model = resolve_model(pipe.tier)
+    messages = _normalise(prompt, pipe.system)
+    request = {"model": model, "messages": messages, "temperature": 0.0, "max_tokens": 600,
+               "response_format": None, "tools": None, "tool_choice": None}
+    key = cache.make_key("chat", request)
+    trace_id = uuid.uuid4().hex[:12]
+    retrieve_ms = (time.perf_counter() - t0) * 1000
+
+    def generate():
+        parts: list[str] = []
+        ttft_ms = None
+        source = "model"
+        usd = 0.0
         try:
-            with tracing.trace("http.ask.stream", question=req.question[:120]) as span:
-                pipe = pipeline()
-                result = pipe.answer(req.question)
-
-                # Stream answer text word-by-word to simulate token streaming
-                words = result.answer.split()
-                ttft_done = False
-                for i, word in enumerate(words):
-                    chunk = word + (" " if i < len(words) - 1 else "")
-                    yield f"data: {json.dumps({'token': chunk})}\n\n"
-                    if not ttft_done:
+            hit = cache.get(key)
+            if hit is not None:
+                source = "cache"
+                words = hit["text"].split(" ")
+                for i, w in enumerate(words):
+                    tok = w + (" " if i < len(words) - 1 else "")
+                    if ttft_ms is None:
                         ttft_ms = (time.perf_counter() - t0) * 1000
-                        span["ttft_ms"] = round(ttft_ms, 1)
-                        ttft_done = True
-                    await _async_sleep(0.01)   # simulate token-by-token pacing
+                    parts.append(tok)
+                    yield _sse({"token": tok})
+            elif settings.offline:
+                raise CacheMiss("AIP_OFFLINE=1 and this streamed answer is not cached")
+            else:
+                from litellm import completion
 
-                # Citations event sent at end (B3: prose streamed, citations held)
-                latency_ms = (time.perf_counter() - t0) * 1000
-                cost_usd = max(0.0, global_budget().spent_usd - cost_before)
-                citations = [
-                    {"index": i + 1, "doc_id": h.doc_id, "excerpt": h.text[:400]}
-                    for i, h in enumerate(result.hits)
-                ]
-                yield f"data: {json.dumps({'citations': citations, 'refused': result.refused, 'latency_ms': round(latency_ms, 1), 'cost_usd': round(cost_usd, 6), 'trace_id': span['span_id']})}\n\n"
-                yield "data: [DONE]\n\n"
-        except BudgetExceeded as exc:
-            yield f"data: {json.dumps({'error': '429', 'detail': str(exc)})}\n\n"
-        except Exception as exc:   # noqa: BLE001
-            yield f"data: {json.dumps({'error': '503', 'detail': str(exc)[:200]})}\n\n"
+                pt = ct = 0
+                t_gen = time.perf_counter()
+                for chunk in completion(model=model, messages=messages, temperature=0.0,
+                                        max_tokens=600, stream=True,
+                                        stream_options={"include_usage": True},
+                                        timeout=settings.timeout_s):
+                    if getattr(chunk, "usage", None):
+                        pt = int(chunk.usage.prompt_tokens or 0)
+                        ct = int(chunk.usage.completion_tokens or 0)
+                    delta = chunk.choices[0].delta.content if chunk.choices else None
+                    if delta:
+                        if ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - t0) * 1000
+                        parts.append(delta)
+                        yield _sse({"token": delta})
+                gen_ms = (time.perf_counter() - t_gen) * 1000
+                usd = cost.price_of(model, pt, ct)
+                text = "".join(parts)
+                cache.put(key, "chat", request, {
+                    "text": text, "tool_calls": [], "finish_reason": "stop",
+                    "usage": {"prompt_tokens": pt, "completion_tokens": ct,
+                              "cost_usd": usd, "latency_ms": gen_ms, "cached": False}})
+                cost.record(cost.Usage(model, pt, ct, usd, gen_ms, cached=False, calls=1,
+                                       priced=cost.is_priced(model)))
+
+            text = "".join(parts).strip()
+            refused = text.startswith(REFUSAL[:40])
+            ok, invalid = enforce_citations(text, len(hits))
+            total_ms = (time.perf_counter() - t0) * 1000
+            _record(total_ms, "none", refused, usd)
+            tracing.event("http.ask.stream", trace_id=trace_id, question=req.question[:120],
+                          duration_ms=round(total_ms, 1), ttft_ms=round(ttft_ms or total_ms, 1),
+                          retrieve_ms=round(retrieve_ms, 1), refused=refused,
+                          citations_valid=ok or refused, source=source,
+                          cost_usd=round(usd, 6), cache_hit="none")
+            yield _sse({
+                "citations": [] if refused else _citations(hits),
+                "citations_valid": ok or refused,
+                "invalid_citations": invalid,
+                "refused": refused,
+                "ttft_ms": round(ttft_ms or total_ms, 1),
+                "latency_ms": round(total_ms, 1),
+                "cost_usd": round(usd, 6),
+                "trace_id": trace_id,
+                "source": source,
+            })
+            yield "data: [DONE]\n\n"
+        except Exception as exc:  # noqa: BLE001
+            err = _classify(exc)
+            tracing.event("http.ask.stream", trace_id=trace_id, status="error",
+                          error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            yield _sse({"error": err.status_code, "detail": err.detail})
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-async def _async_sleep(secs: float) -> None:
-    import asyncio
-    await asyncio.sleep(secs)
-
-
+# ---------------------------------------------------------------------------
+# GET /health and GET /metrics
+# ---------------------------------------------------------------------------
 @app.get("/health")
 def health() -> dict:
-    """C: index size, model profile, cache stats, uptime."""
     from aip.config import settings
 
-    pipe = pipeline()
-    n_chunks = len(pipe.retriever.retrievers[0].chunks) if hasattr(pipe.retriever, "retrievers") else 0
-
+    n_chunks = 0
+    if _PIPELINE is not None and hasattr(_PIPELINE.retriever, "retrievers"):
+        n_chunks = len(_PIPELINE.retriever.retrievers[0].chunks)
     return {
-        "status": "ok",
+        "status": "ok" if _PIPELINE is not None else "degraded",
+        "startup_error": _STARTUP_ERROR if _PIPELINE is None else None,
         "uptime_s": round(time.time() - _STARTED, 1),
         "index_size_chunks": n_chunks,
+        "pipeline": shipped.config_dict(),
         "model_profile": settings.profile,
         "models": settings.models,
+        "offline": settings.offline,
         "cache": cache.stats(),
         "semantic_cache_size": len(_SEM_CACHE),
         "semantic_cache_threshold": _SEM_THRESHOLD,
     }
 
 
+def _pct(xs: list[float], p: float) -> float:
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return round(s[min(len(s) - 1, int(round(p / 100 * (len(s) - 1))))], 1)
+
+
+def refusal_alert(reqs: list[dict], recent_n: int = 20, min_baseline: int = 20) -> dict:
+    """C4: fire when the recent refusal rate is at least double the baseline.
+
+    A broken index throws no errors, adds no latency and costs nothing -- the
+    system just starts declining. Baseline = everything before the most recent
+    `recent_n` requests (needs >= `min_baseline` of them).
+    """
+    if len(reqs) < recent_n + min_baseline:
+        return {"firing": False, "reason": f"need {recent_n + min_baseline} requests, have {len(reqs)}"}
+    base, recent = reqs[:-recent_n], reqs[-recent_n:]
+    b = sum(r["refused"] for r in base) / len(base)
+    r = sum(x["refused"] for x in recent) / len(recent)
+    firing = r >= 2 * b and r > 0 if b > 0 else r >= 0.25
+    return {"firing": firing, "baseline_refusal_rate": round(b, 4),
+            "recent_refusal_rate": round(r, 4),
+            "runbook": "check n_hits on rag.retrieve spans; 0 -> rebuild index; "
+                       ">0 -> check recent corpus changes" if firing else None}
+
+
 @app.get("/metrics")
 def metrics() -> dict:
-    """C2: cost today, cost/query, cache hit rate, p50/p95/p99, error rate."""
+    """C2: cost, cost/query, cache hit rate, latency percentiles (cached and
+    uncached quoted separately), error rate by type, refusal rate + alert."""
     b = global_budget()
-    total = _TOTAL_REQUESTS or 1
-    cache_hits = _EXACT_HITS + _SEM_HITS
-
-    def percentile(xs: list[float], p: float) -> float:
-        if not xs:
-            return 0.0
-        s = sorted(xs)
-        idx = min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1))))
-        return round(s[idx], 1)
-
-    lats = list(_LATENCIES)
-
-    # Error rate breakdown
-    error_by_type: dict[str, int] = {}
-    for e in _ERRORS:
-        k = e.get("type", "unknown")
-        error_by_type[k] = error_by_type.get(k, 0) + 1
-
+    with _LOCK:
+        reqs, errs, total = list(_REQUESTS), list(_ERRORS), _TOTAL
+    answered = len(reqs)
+    cached = [r for r in reqs if r["layer"] != "none"]
+    uncached = [r for r in reqs if r["layer"] == "none"]
+    lat = [r["latency_ms"] for r in reqs]
+    by_type: dict[str, int] = {}
+    for e in errs:
+        by_type[e["type"]] = by_type.get(e["type"], 0) + 1
     return {
-        **b.as_dict(),
-        "total_requests": _TOTAL_REQUESTS,
-        "exact_cache_hits": _EXACT_HITS,
-        "semantic_cache_hits": _SEM_HITS,
-        "cache_hit_rate": round(cache_hits / total, 4),
-        "cost_per_query_usd": round(b.spent_usd / max(1, b.calls), 6),
-        "p50_latency_ms": percentile(lats, 50),
-        "p95_latency_ms": percentile(lats, 95),
-        "p99_latency_ms": percentile(lats, 99),
-        "error_rate": round(len(_ERRORS) / total, 4),
-        "errors_by_type": error_by_type,
-        "tool_call_count": b.calls,
-        # Alert: refusal rate — watch this; doubling usually means index broke
-        "refusal_rate": "see /ask traces",
+        "total_requests": total,
+        "answered": answered,
+        "cost_usd_total": round(b.spent_usd, 6),
+        "cost_per_query_usd": round(b.spent_usd / answered, 6) if answered else 0.0,
+        "cost_per_uncached_query_usd": round(sum(r["cost_usd"] for r in uncached) / len(uncached), 6)
+        if uncached else 0.0,
+        "exact_cache_hits": sum(r["layer"] == "exact" for r in reqs),
+        "semantic_cache_hits": sum(r["layer"] == "semantic" for r in reqs),
+        "cache_hit_rate": round(len(cached) / answered, 4) if answered else 0.0,
+        "p50_latency_ms": _pct(lat, 50),
+        "p95_latency_ms": _pct(lat, 95),
+        "p99_latency_ms": _pct(lat, 99),
+        "p95_latency_cached_ms": _pct([r["latency_ms"] for r in cached], 95),
+        "p95_latency_uncached_ms": _pct([r["latency_ms"] for r in uncached], 95),
+        "error_rate": round(len(errs) / total, 4) if total else 0.0,
+        "errors_by_type": by_type,
+        "refusal_rate": round(sum(r["refused"] for r in reqs) / answered, 4) if answered else 0.0,
+        "alert_refusal_rate_doubled": refusal_alert(reqs),
+        "model_calls": b.calls,
+        "model_calls_cached": b.cached_calls,
+        "unpriced_calls": b.unpriced_calls,
     }

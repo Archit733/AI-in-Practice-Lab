@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-"""Lab 7 — the regression gate. Exits non-zero when a threshold is breached.
+"""Lab 7 -- the regression gate. Exits non-zero when a threshold is breached.
 
-    python labs/lab7/gate.py --config labs/lab7/thresholds.yml
+    python labs/lab7/gate.py                      # live: calls the model, fills the cache
+    AIP_OFFLINE=1 python labs/lab7/gate.py        # CI: replays the committed cache, $0
 
-Run with AIP_OFFLINE=1 for CI (replays committed cache, costs nothing):
-    AIP_OFFLINE=1 python labs/lab7/gate.py
+How it works
+------------
+The gate runs the *shipped* pipeline (labs/lab7/pipeline.py -- the same object
+the service builds) over every golden question, then judges the answers.
+
+With AIP_OFFLINE=1 every model call is served from .aip_cache/calls.sqlite3.
+A call is a cache hit only if its request is byte-identical to one recorded
+earlier, so the cache doubles as a tripwire: change FINAL_K, the chunking,
+the prompt or the corpus, and the prompts change, the cache misses, and the
+gate goes red. That is why D3 works offline.
+
+Metrics (all measured; nothing is hardcoded)
+--------------------------------------------
+  correctness         LLM judge vs gold answer, 0/1/2 scaled to 0..1
+  faithfulness        LLM judge: is every claim supported by the context (0/1)
+  citation_validity   every [n] indexes a real source (refusals count as valid)
+  refusal_recall      unanswerable questions that were refused
+  refusal_precision   refusals that were on unanswerable questions
+  hit_rate_at_5       a relevant doc is among the chunks the generator saw
+  cost_per_query_usd  recorded cost of the generation call (uncached price)
+  p95_latency_ms      recorded generation latency + measured retrieval time
+  cache_coverage      share of golden questions reproducible from the cache
+                      (only < 1.0 offline; a miss means the pipeline changed
+                      or the cache was not warmed for this configuration)
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
-import re
 import sqlite3
 import statistics
 import sys
@@ -23,286 +46,196 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 GOLDEN_PATH = ROOT / "data/eval/rag_golden.jsonl"
-CACHE_DB = ROOT / ".aip_cache/calls.sqlite3"
+SETUP_ERROR = 2
 
 
 def _load_golden() -> list[dict]:
-    rows = []
     with GOLDEN_PATH.open(encoding="utf-8") as fh:
-        for line in fh:
-            if line.strip():
-                rows.append(json.loads(line))
-    return rows
+        return [json.loads(line) for line in fh if line.strip()]
 
 
-def _measure_offline(rows: list[dict]) -> dict[str, float]:
-    """Offline evaluator: replays the committed SQLite cache directly.
-
-    This ensures CI runs deterministically with AIP_OFFLINE=1, needs zero API
-    calls or network access, and perfectly mirrors the Lab 4 evaluation run.
-    """
-    from aip.guards import enforce_citations
-    from aip.evals import retrieval_metrics
-
-    conn = sqlite3.connect(CACHE_DB)
-    cached_calls = conn.execute(
-        "SELECT request, response FROM calls WHERE kind = 'chat'"
-    ).fetchall()
-
-    q_to_ans: dict[str, str] = {}
-    q_to_ctx: dict[str, str] = {}
-    for req_str, resp_str in cached_calls:
-        req = json.loads(req_str)
-        resp = json.loads(resp_str)
-        msgs = req.get("messages", [])
-        if len(msgs) == 2 and msgs[0].get("role") == "system" and msgs[1].get("role") == "user":
-            c = msgs[1]["content"]
-            if "<RETRIEVED_DOCUMENT>" in c and "Question:" in c:
-                q = c.split("Question:")[1].split("Answer with citations:")[0].strip()
-                ctx = c.split("<RETRIEVED_DOCUMENT>")[1].split("</RETRIEVED_DOCUMENT>")[0].strip()
-                if "gold_" not in ctx:
-                    q_to_ans[q] = resp.get("text", "")
-                    q_to_ctx[q] = ctx
-
-    c_scores: dict[str, int] = {}
-    f_scores: dict[str, int] = {}
-    for req_str, resp_str in cached_calls:
-        req = json.loads(req_str)
-        resp = json.loads(resp_str)
-        for m in req.get("messages", []):
-            c = m.get("content", "")
-            if "Compare a CANDIDATE answer to a REFERENCE answer" in c and "QUESTION:" in c:
-                q = c.split("QUESTION:")[1].split("REFERENCE:")[0].strip()
-                t = resp.get("text", "")
-                m_score = re.search(r'"score":\s*(\d+)', t)
-                if m_score:
-                    c_scores[q] = int(m_score.group(1))
-            elif "You are grading whether an ANSWER is fully supported" in c and "ANSWER:" in c:
-                ans = c.split("ANSWER:")[1].split("Reply as JSON:")[0].strip()
-                for q, a in q_to_ans.items():
-                    if a.strip() == ans:
-                        t = resp.get("text", "")
-                        m_score = re.search(r'"score":\s*(\d+)', t)
-                        if m_score:
-                            f_scores[q] = int(m_score.group(1))
-
-    correctness: list[float] = []
-    faithfulness: list[float] = []
-    citation_validity: list[float] = []
-    hit_rate_at_5_list: list[float] = []
-    refusal_recall_hits = 0
-    unanswerable_total = 0
-
-    for item in rows:
-        q = item["question"]
-        if q not in q_to_ans:
-            continue
-        ans = q_to_ans[q]
-        ctx = q_to_ctx[q]
-
-        if item.get("relevant_docs"):
-            sources = re.findall(r"\(source: ([^\)]+)\)", ctx)
-            m = retrieval_metrics(sources, item["relevant_docs"], ks=(5,))
-            hit_rate_at_5_list.append(m["hit_rate@5"])
-
-        n_sources = len(re.findall(r"\[\d+\] \(source:", ctx))
-        is_refusal = ans.strip().startswith("I don't have enough information")
-
-        if item["kind"] == "unanswerable":
-            unanswerable_total += 1
-            if is_refusal:
-                refusal_recall_hits += 1
-
-        if is_refusal:
-            citation_validity.append(1.0)
-        else:
-            ok, _ = enforce_citations(ans, n_sources)
-            citation_validity.append(float(ok))
-
-        if q in c_scores:
-            correctness.append(c_scores[q] / 2.0)
-        if q in f_scores:
-            faithfulness.append(float(f_scores[q]))
-
-    ref_recall = (refusal_recall_hits / unanswerable_total) if unanswerable_total else 1.0
-
-    return {
-        "correctness": round(statistics.fmean(correctness), 4) if correctness else 0.0,
-        "faithfulness": round(statistics.fmean(faithfulness), 4) if faithfulness else 0.0,
-        "citation_validity": round(statistics.fmean(citation_validity), 4) if citation_validity else 0.0,
-        "refusal_recall": round(ref_recall, 4),
-        "refusal_precision": 0.80,
-        "hit_rate_at_5": round(statistics.fmean(hit_rate_at_5_list), 4) if hit_rate_at_5_list else 0.0,
-        "cost_per_query_usd": 0.0031,
-        "p95_latency_ms": 4200.0,
-    }
-
-
-def _measure_live(rows: list[dict]) -> dict[str, float]:
-    """Live evaluator: builds the pipeline and queries the model."""
-    from aip.chunking import markdown_chunks
-    from aip.cost import global_budget
-    from aip.guards import enforce_citations
-    from aip.evals import llm_judge, retrieval_metrics
-    from aip.rag import RagPipeline
-    from aip.retrieval import Bm25Retriever, DenseRetriever, HybridRetriever
-    from labs.lab4.evaluate import CORRECTNESS_RUBRIC, FAITHFULNESS_RUBRIC
-
-    CORPUS_DIR = ROOT / "data/corpus"
-    corpus = {p.stem: p.read_text(encoding="utf-8")
-              for p in sorted(CORPUS_DIR.glob("*.md"))}
-    chunks = [c for doc_id, text in corpus.items()
-              if "ARCHIVED" not in doc_id
-              for c in markdown_chunks(text, doc_id, size=400)]
-
-    dense = DenseRetriever(chunks, show_progress=False)
-    bm25 = Bm25Retriever(chunks)
-    retriever = HybridRetriever([dense, bm25], rrf_k=60)
-    pipe = RagPipeline(retriever, k=12, final_k=5, tier="MAIN")
-
-    retrieval_rows = [r for r in rows if r.get("relevant_docs")]
-    hit_at_5: list[float] = []
-    for row in retrieval_rows:
-        hits = retriever.search(row["question"], k=12)
-        seen: list[str] = []
-        for h in hits:
-            if h.doc_id not in seen:
-                seen.append(h.doc_id)
-        m = retrieval_metrics(seen, row["relevant_docs"], ks=(5,))
-        hit_at_5.append(m["hit_rate@5"])
-
-    unanswerable_ids = {r["id"] for r in rows if r["kind"] == "unanswerable"}
-    answerable_rows = [r for r in rows if r["id"] not in unanswerable_ids
-                       and r.get("relevant_docs")]
-    refusal_rows = [r for r in rows if r["id"] in unanswerable_ids]
-
-    correctness_scores: list[float] = []
-    faithfulness_scores: list[float] = []
-    citation_valid_scores: list[float] = []
-    latencies_ms: list[float] = []
-    costs_usd: list[float] = []
-
-    for row in answerable_rows[:20]:
-        t0 = time.perf_counter()
-        cost_before = global_budget().spent_usd
-        try:
-            result = pipe.answer(row["question"])
-        except Exception as exc:  # noqa: BLE001
-            print(f"  ERROR on {row['id']}: {exc}", file=sys.stderr)
-            continue
-
-        lat = (time.perf_counter() - t0) * 1000
-        latencies_ms.append(lat)
-        costs_usd.append(max(0.0, global_budget().spent_usd - cost_before))
-
-        n = len(result.hits)
-        if result.refused:
-            citation_valid_scores.append(1.0)
-        else:
-            ok, _ = enforce_citations(result.answer, n)
-            citation_valid_scores.append(float(ok))
-
-        try:
-            verdict = llm_judge(
-                CORRECTNESS_RUBRIC.format(
-                    question=row["question"],
-                    reference=row.get("gold_answer", ""),
-                    candidate=result.answer,
-                ),
-                tier="LARGE",
-            )
-            correctness_scores.append(min(1.0, verdict.get("score", 0) / 2.0))
-        except Exception:  # noqa: BLE001
-            pass
-
-        try:
-            from aip.retrieval import format_context
-            context = format_context(result.hits)
-            verdict = llm_judge(
-                FAITHFULNESS_RUBRIC.format(context=context[:3000],
-                                           answer=result.answer),
-                tier="LARGE",
-            )
-            faithfulness_scores.append(float(verdict.get("score", 0)))
-        except Exception:  # noqa: BLE001
-            pass
-
-    refusal_answers: list[bool] = []
-    for row in refusal_rows:
-        try:
-            result = pipe.answer(row["question"])
-            refusal_answers.append(result.refused)
-        except Exception:  # noqa: BLE001
-            refusal_answers.append(False)
-
-    n_refusal = len(refusal_rows)
-    refusal_recall = (sum(refusal_answers) / n_refusal) if n_refusal else 1.0
-
-    non_refusals: list[bool] = []
-    for row in answerable_rows[:10]:
-        try:
-            result = pipe.answer(row["question"])
-            non_refusals.append(not result.refused)
-        except Exception:  # noqa: BLE001
-            non_refusals.append(False)
-
-    true_refusals = sum(refusal_answers)
-    false_refusals = sum(1 for r in non_refusals if not r)
-    refusal_precision = (true_refusals / (true_refusals + false_refusals)
-                         if (true_refusals + false_refusals) > 0 else 1.0)
-
-    p95_lat = sorted(latencies_ms)[int(0.95 * (len(latencies_ms) - 1))] if latencies_ms else 0.0
-
-    return {
-        "correctness": round(statistics.fmean(correctness_scores), 4) if correctness_scores else 0.0,
-        "faithfulness": round(statistics.fmean(faithfulness_scores), 4) if faithfulness_scores else 0.0,
-        "citation_validity": round(statistics.fmean(citation_valid_scores), 4) if citation_valid_scores else 0.0,
-        "refusal_recall": round(refusal_recall, 4),
-        "refusal_precision": round(refusal_precision, 4),
-        "hit_rate_at_5": round(statistics.fmean(hit_at_5), 4) if hit_at_5 else 0.0,
-        "cost_per_query_usd": round(statistics.fmean(costs_usd), 4) if costs_usd else 0.0,
-        "p95_latency_ms": round(p95_lat, 1),
-    }
-
-
-def measure() -> dict[str, float]:
-    """D1: Run the golden set and return the metric dict.
-
-    Keys match thresholds.yml. In CI or offline mode (AIP_OFFLINE=1 or no network),
-    it uses _measure_offline to replay the committed SQLite cache.
-    """
+def _check_cache(offline: bool) -> str | None:
+    """Return an error message if the offline cache is unusable, else None."""
     from aip.config import settings
 
-    rows = _load_golden()
-    if settings.offline or not CACHE_DB.exists():
-        return _measure_offline(rows)
+    db = settings.cache_dir / "calls.sqlite3"
+    if not offline:
+        return None
+    if not db.exists() or db.stat().st_size == 0:
+        return (f"AIP_OFFLINE=1 but {db} is missing or empty.\n"
+                "Run the gate once online to warm it, then commit it:\n"
+                "  python labs/lab7/gate.py\n"
+                "  git add -f .aip_cache/calls.sqlite3 && git commit -m 'Warm eval cache'")
+    with contextlib.closing(sqlite3.connect(db)) as conn:
+        has = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='calls'"
+        ).fetchone()
+        n = conn.execute("SELECT COUNT(*) FROM calls").fetchone()[0] if has else 0
+    if not n:
+        return f"{db} has no recorded calls. Warm it online first (see above)."
+    return None
 
-    try:
-        return _measure_live(rows)
-    except Exception as exc:  # noqa: BLE001
-        print(f"Live evaluation fallback to cache: {exc}", file=sys.stderr)
-        return _measure_offline(rows)
+
+class _UsageTap:
+    """Records the *original* cost and latency of every model call.
+
+    On a cache hit aip.llm reports cost 0 and latency 0 (correct for billing),
+    but the cached response still carries what the call cost when it was
+    recorded. That is the number the gate needs: the uncached price.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    @contextlib.contextmanager
+    def install(self):
+        import aip.llm as llm
+
+        original = llm.raw_call
+
+        def tapped(*args, **kwargs):
+            t0 = time.perf_counter()
+            res = original(*args, **kwargs)
+            u = res.get("usage", {})
+            self.calls.append({
+                "cost_usd": float(u.get("cost_usd") or 0.0),
+                "recorded_latency_ms": float(u.get("latency_ms") or 0.0),
+                "wall_ms": (time.perf_counter() - t0) * 1000,
+            })
+            return res
+
+        llm.raw_call = tapped
+        try:
+            yield self
+        finally:
+            llm.raw_call = original
+
+
+def measure(limit: int | None = None, verbose: bool = False) -> tuple[dict, list[dict]]:
+    from aip.cache import CacheMiss
+    from aip.evals import llm_judge, retrieval_metrics
+    from aip.guards import enforce_citations
+    from aip.retrieval import format_context
+    from labs.lab4.evaluate import CORRECTNESS_RUBRIC, FAITHFULNESS_RUBRIC
+    from labs.lab7.pipeline import build_pipeline
+
+    rows = _load_golden()[:limit] if limit else _load_golden()
+    pipe = build_pipeline()        # raises CacheMiss offline if embeddings missing
+    tap = _UsageTap()
+
+    details: list[dict] = []
+    with tap.install():
+        for row in rows:
+            d = {"id": row["id"], "kind": row["kind"], "status": "ok"}
+            try:
+                # Retrieval is local (embeddings come from the cache), so it is
+                # measured for every question -- even when generation is not
+                # reproducible. This is what shows the real damage of a D3 break.
+                d["final_docs"] = [h.doc_id for h in
+                                   pipe.rerank(row["question"], pipe.retrieve(row["question"]))]
+            except CacheMiss:
+                d["status"] = "cache_miss"
+                details.append(d)
+                continue
+            try:
+                n0 = len(tap.calls)
+                t0 = time.perf_counter()
+                result = pipe.answer(row["question"])
+                wall_ms = (time.perf_counter() - t0) * 1000
+                gen = tap.calls[n0:]
+                d.update(
+                    refused=result.refused,
+                    cost_usd=sum(c["cost_usd"] for c in gen),
+                    # end-to-end as if uncached: our retrieval time + recorded model time
+                    latency_ms=wall_ms - sum(c["wall_ms"] for c in gen)
+                    + sum(c["recorded_latency_ms"] for c in gen),
+                )
+                ok, _invalid = enforce_citations(result.answer, len(result.hits))
+                d["citation_valid"] = 1.0 if result.refused else float(ok)
+
+                if row.get("gold_answer"):
+                    v = llm_judge(CORRECTNESS_RUBRIC.format(
+                        question=row["question"], reference=row["gold_answer"],
+                        candidate=result.answer), tier="LARGE")
+                    d["correctness"] = min(1.0, float(v.get("score", 0)) / 2.0)
+                if not result.refused:
+                    v = llm_judge(FAITHFULNESS_RUBRIC.format(
+                        context=format_context(result.hits)[:3000],
+                        answer=result.answer), tier="LARGE")
+                    d["faithfulness"] = float(v.get("score", 0))
+            except CacheMiss:
+                d["status"] = "cache_miss"
+            details.append(d)
+            if verbose:
+                print(f"  {row['id']}: {d['status']}"
+                      f"{' refused' if d.get('refused') else ''}", file=sys.stderr)
+
+    done = [d for d in details if d["status"] == "ok"]
+    by_id = {r["id"]: r for r in rows}
+
+    def mean(xs):
+        xs = list(xs)
+        return round(statistics.fmean(xs), 4) if xs else None   # None = not measured
+
+    hit = [retrieval_metrics(d["final_docs"], by_id[d["id"]]["relevant_docs"], ks=(5,))["hit_rate@5"]
+           for d in details if "final_docs" in d and by_id[d["id"]].get("relevant_docs")]
+    unans = [d for d in done if d["kind"] == "unanswerable"]
+    refusals = [d for d in done if d["refused"]]
+    lats = sorted(d["latency_ms"] for d in done)
+    p95 = lats[min(len(lats) - 1, int(round(0.95 * (len(lats) - 1))))] if lats else None
+
+    metrics = {
+        "correctness": mean(d["correctness"] for d in done if "correctness" in d),
+        "faithfulness": mean(d["faithfulness"] for d in done if "faithfulness" in d),
+        "citation_validity": mean(d["citation_valid"] for d in done),
+        "refusal_recall": round(sum(d["refused"] for d in unans) / len(unans), 4) if unans else None,
+        "refusal_precision": (round(sum(1 for d in refusals if d["kind"] == "unanswerable")
+                                    / len(refusals), 4) if refusals else 1.0) if done else None,
+        "hit_rate_at_5": mean(hit),
+        "cost_per_query_usd": mean(d["cost_usd"] for d in done),
+        "p95_latency_ms": round(p95, 1) if lats else None,
+        "cache_coverage": round(len(done) / len(rows), 4) if rows else 0.0,
+    }
+    return metrics, details
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="labs/lab7/thresholds.yml")
+    ap.add_argument("--limit", type=int, default=None, help="first N golden questions only")
+    ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
+
+    from aip.cache import CacheMiss
+    from aip.config import settings
+    from labs.lab7.pipeline import config_dict
 
     thresholds = yaml.safe_load((ROOT / args.config).read_text(encoding="utf-8"))
 
-    print("Running golden set evaluation…")
-    metrics = measure()
+    err = _check_cache(settings.offline)
+    if err:
+        print(f"GATE SETUP ERROR:\n{err}", file=sys.stderr)
+        return SETUP_ERROR
+
+    mode = "offline replay" if settings.offline else "live"
+    print(f"Running golden set ({mode}) with pipeline {config_dict()} ...")
+    try:
+        metrics, details = measure(args.limit, args.verbose)
+    except CacheMiss as exc:
+        # The index itself could not be rebuilt from the cache: chunking or
+        # the corpus changed. That is a real regression signal, not a crash.
+        print(f"\nGATE FAILED: pipeline could not be rebuilt from the cache.\n{exc}")
+        return 1
 
     failures = []
     width = max(len(k) for k in thresholds)
-    print(f"\n{'metric':<{width}}  {'value':>10}  {'gate':>14}  status")
-    print("-" * (width + 40))
+    print(f"\n{'metric':<{width}}  {'value':>10}  {'gate':>10}  status")
+    print("-" * (width + 36))
     for name, rule in thresholds.items():
         value = metrics.get(name)
         if value is None:
-            failures.append(f"{name}: not measured")
-            print(f"{name:<{width}}  {'—':>10}  {'':>14}  MISSING")
+            failures.append(f"{name}: not measured (no reproducible answers)")
+            print(f"{name:<{width}}  {'-':>10}  {'':>10}  NOT MEASURED")
             continue
         ok, gate = True, ""
         if "min" in rule:
@@ -311,19 +244,23 @@ def main() -> int:
             gate, ok = f"<= {rule['max']}", value <= rule["max"]
         if not ok:
             failures.append(f"{name}: {value} violates {gate}")
-        print(f"{name:<{width}}  {value:>10.4f}  {gate:>14}  {'ok' if ok else 'FAIL'}")
+        print(f"{name:<{width}}  {value:>10.4f}  {gate:>10}  {'ok' if ok else 'FAIL'}")
 
-    # Save report for CI artifact upload
+    misses = [d["id"] for d in details if d["status"] == "cache_miss"]
+    if misses:
+        print(f"\n{len(misses)} question(s) not reproducible from the cache: "
+              f"{', '.join(misses[:10])}{' ...' if len(misses) > 10 else ''}")
+
     report_dir = ROOT / "reports"
     report_dir.mkdir(exist_ok=True)
-    report_path = report_dir / "gate_report.json"
-    report_path.write_text(
-        json.dumps({"metrics": metrics, "thresholds": thresholds,
-                    "failures": failures, "passed": not failures},
-                   indent=2),
-        encoding="utf-8",
-    )
-    print(f"\nReport saved to {report_path}")
+    report = {"mode": mode, "pipeline": config_dict(), "metrics": metrics,
+              "thresholds": thresholds, "failures": failures, "passed": not failures,
+              "n_questions": len(details), "cache_misses": misses}
+    (report_dir / "gate_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+    with (report_dir / "gate_details.jsonl").open("w", encoding="utf-8") as fh:
+        for d in details:
+            fh.write(json.dumps(d) + "\n")
+    print("\nReport saved to reports/gate_report.json (per-question: gate_details.jsonl)")
 
     if failures:
         print("\nGATE FAILED:")

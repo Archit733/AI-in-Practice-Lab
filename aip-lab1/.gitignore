@@ -3,5 +3,7 @@
 __pycache__/
 *.pyc
 .DS_Store
-.aip_cache/
+# Commit the model-call cache so CI and graders can run AIP_OFFLINE=1.
+.aip_cache/*
+!.aip_cache/calls.sqlite3
 .aip_traces/
