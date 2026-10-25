@@ -1,0 +1,44 @@
+name: eval-gate
+
+# Runs the golden-set regression gate on every push and pull request.
+#
+# GitHub only reads workflows from .github/workflows/ at the REPOSITORY ROOT.
+# The copy under aip-lab1/.github/ is never executed, so this file is the one
+# that matters. Everything runs inside aip-lab1/.
+#
+# AIP_OFFLINE=1 replays the committed cache (aip-lab1/.aip_cache/calls.sqlite3):
+# no API key, no cost, deterministic. If the shipped pipeline changes, its
+# prompts change, the cache misses, and the gate fails -- by design.
+
+on: [push, pull_request]
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aip-lab1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: aip-lab1/requirements.txt
+      - run: pip install -r requirements.txt
+      - name: Service smoke test (stand-in model, no API key)
+        run: python -m pytest tests/test_lab7.py -v
+      - name: Regression gate
+        env:
+          AIP_OFFLINE: "1"
+          AIP_PROFILE: gemini
+        run: python labs/lab7/gate.py --config labs/lab7/thresholds.yml
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: |
+            aip-lab1/reports/gate_report.json
+            aip-lab1/reports/gate_details.jsonl
+          if-no-files-found: warn

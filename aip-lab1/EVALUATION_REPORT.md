@@ -26,7 +26,9 @@ The Aurora Policy Assistant answers questions about Aurora Health Insurance poli
 | p95 latency, uncached (ms) | 4 200 | ≤ 6 000 | ✅ pass |
 | p95 latency, cached (ms) | ~35 | ≤ 800 | ✅ pass |
 
-*n = 20 evaluated for generation metrics (cost budget constraint); retrieval metrics computed over all 42 answerable questions.*
+*All 45 questions are evaluated by `labs/lab7/gate.py`, which runs the shipped pipeline (`labs/lab7/pipeline.py`). Retrieval hit-rate is measured over the 42 questions with relevant documents. Small samples: refusal recall rests on 5 unanswerable questions, so one miss moves it by 0.20.*
+
+> **TODO(Archit) before submitting:** refresh this table from `reports/gate_report.json` after the warm run (`python labs/lab7/gate.py`). The figures above predate the gate rewrite, which now evaluates all 45 questions and measures cost and latency instead of hardcoding them.
 
 ---
 
@@ -53,7 +55,7 @@ The Aurora Policy Assistant answers questions about Aurora Health Insurance poli
 | Per query (uncached) | \$0.0031 |
 | Per query (cached exact hit) | \$0.00 |
 | Per 1 000 queries (30% cache hit rate) | \$2.17 |
-| Per year at 10 000 queries/day | \$7 905 |
+| Per year at 10 000 queries/day | \$7 920 (\$8 830 at the measured 22% hit rate) |
 
 *Model: gemini-3.7-flash (MAIN) for generation, gemini-embedding-001 (EMBED) for retrieval. Prices per ai.google.dev 2026-08-22. The 30% exact-cache hit rate is conservative; measured rate on the dev traffic was 22%.*
 
@@ -77,7 +79,9 @@ total            ~4 160 ms
 
 **What to optimise first:** Generation dominates at 98% of total latency. The main lever is **answer length** — the model currently outputs 80–200 tokens; halving that would save ~2 seconds. The cost of shortening is precision: Lab 5's measurement showed that aggressive length reduction (max_tokens=150) drops correctness by ~0.08. A better first step is to reduce the context size (`max_context_chars` from 8 000 to 4 000) and measure whether correctness holds — the retriever currently sends more text than the model uses.
 
-**Streaming TTFT** (measured on 10 queries): median 420 ms, p95 780 ms. The streaming endpoint (`POST /ask/stream`) cuts perceived wait time from ~4 s to ~0.8 s because text starts arriving within 1 second.
+**Streaming TTFT.** `POST /ask/stream` streams model tokens as they are generated and reports `ttft_ms` in its final event. Citations are validated after generation and sent last, with `citations_valid`; the UI warns when it is false.
+
+> **TODO(Archit) before submitting:** measure TTFT on 10 uncached queries through `/ask/stream` and report median and p95 here. An earlier version split a finished answer into words, so its TTFT figures (420 / 780 ms) were not real and have been removed.
 
 ---
 

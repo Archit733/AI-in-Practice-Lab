@@ -138,7 +138,7 @@ RAG models generate output tokens sequentially. A 4-second completion feels like
 | **3. Stream Prose, Hold Citations to End** | Stream answer tokens immediately (low TTFT); hold structured citations and metadata until generation finishes; deliver as the terminal SSE event. | Grounding sources appear ~1–2 seconds after reading begins. | **Selected & Defended.** |
 
 **Defense of Strategy 3:**  
-In user research and practice, human reading speed is ~200–250 words per minute. Delivering prose immediately satisfies the user's perception of speed (TTFT $\le 780$ ms). By the time the user finishes reading the sentence, the terminal SSE event delivers the verified citations, rendering the expandable source boxes without race conditions.
+In user research and practice, human reading speed is ~200–250 words per minute. Delivering prose immediately satisfies the user's perception of speed: tokens stream from the model as they are generated, and TTFT is reported in the final event (re-measure on your key; the earlier 780 ms figure came from a simulated stream). By the time the user finishes reading the sentence, the terminal SSE event delivers the verified citations, rendering the expandable source boxes without race conditions.
 
 ---
 
@@ -233,7 +233,8 @@ p95_latency_ms:     {max: 6000}
 In `.github/workflows/eval.yml`, CI runs with `AIP_OFFLINE=1` against the committed `.aip_cache/calls.sqlite3`.
 - **Cost in CI:** $0.00.
 - **Network dependency:** Zero.
-- **Determinism:** 100% reproducible; CI failures reflect true code regressions, not provider API drift.
+- **Determinism:** the gate replays the shipped pipeline through the cache, so CI failures reflect code or config changes, not provider drift. A changed prompt cannot hit the cache, which is what makes D3 detectable offline.
+- **Workflow location:** GitHub only runs workflows from `.github/workflows/` at the repository root; the live file is there, not under `aip-lab1/`.
 
 ---
 
@@ -241,21 +242,12 @@ In `.github/workflows/eval.yml`, CI runs with `AIP_OFFLINE=1` against the commit
 > *"A gate you have not seen fail is a gate you do not have."*
 
 To prove the gate is active and functional:
-1. Temporarily change `hit_rate_at_5` requirement in `thresholds.yml` to `1.00`, or drop retriever retrieval depth `k=1`.
-2. Execute gate:
+1. Break the *system*, not the gate: set `FINAL_K = 1` in `labs/lab7/pipeline.py` (the single definition the service and the gate share).
+2. Execute gate, exactly as CI does:
    ```bash
    AIP_OFFLINE=1 python3 labs/lab7/gate.py
    ```
-3. Observed terminal output:
-   ```text
-   metric                   value            gate  status
-   ----------------------------------------------------------
-   hit_rate_at_5           0.9762         >= 1.00  FAIL
-   
-   GATE FAILED:
-     hit_rate_at_5: 0.9762 violates >= 1.00
-   Exit Code: 1
-   ```
+3. What happens: the generator now sees one chunk instead of five, so every generation prompt changes and none of them is in the committed cache (`cache_coverage` 0.0, FAIL). Retrieval is still measured locally, and the share of questions whose context contains a relevant document falls sharply (`hit_rate_at_5`, FAIL). Exit code 1.
 4. This confirms non-zero exit codes propagate to CI runners, blocking broken pull requests.
 
 ---
@@ -295,7 +287,7 @@ p95_latency_ms       4200.0000         <= 6000  ok
 
 - **Unit Query Cost:** $\$0.0031$ (uncached) | $\$0.00$ (cache hit)
 - **At 30% Cache Hit Rate:** $\$2.17$ per 1,000 queries
-- **Enterprise Scale (10,000 queries/day):** $\$7,905$ per year
+- **Enterprise Scale (10,000 queries/day):** $\$7,920$ per year ($\$8,830$ at the measured 22% hit rate)
 
 ---
 

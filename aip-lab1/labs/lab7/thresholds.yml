@@ -11,3 +11,7 @@ refusal_precision:  {min: 0.75}
 hit_rate_at_5:      {min: 0.85}
 cost_per_query_usd: {max: 0.010}
 p95_latency_ms:     {max: 6000}
+# Offline only: share of golden questions the committed cache can reproduce.
+# Anything below 1.0 means the shipped pipeline no longer matches what was
+# recorded (prompt, chunking, final_k or corpus changed) -- re-warm or revert.
+cache_coverage:     {min: 1.0}
